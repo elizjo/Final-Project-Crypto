@@ -17,9 +17,9 @@ class SiFT_MTP:
 		# --------- CONSTANTS ------------
 		self.version_major = 0
 		self.version_minor = 5
-		self.msg_hdr_ver = b'\x00\x01'
+		self.msg_hdr_ver = b'\x01\x00'
 		self.msg_hdr_rsv = b'\x00\x00'
-		self.msg_hdr_sqn = b'\x00\x00'
+		self.msg_hdr_sqn = b'\x00\x01'
 
 		self.size_msg_hdr = 16
 		self.size_msg_hdr_ver = 2
@@ -47,6 +47,7 @@ class SiFT_MTP:
 						  self.type_upload_req_0, self.type_upload_req_1, self.type_upload_res,
 						  self.type_dnload_req, self.type_dnload_res_0, self.type_dnload_res_1)
 		# --------- STATE ------------
+		self.rcv_sqn = b'\x00\x01'
 		self.peer_socket = peer_socket
 		self.temp_key = None
 		self.final_key = None
@@ -103,7 +104,7 @@ class SiFT_MTP:
 			raise SiFT_MTP_Error('Unknown message type found in message header')
 		
 		# for errors in sqn, failed mac varification => no error message
-		if parsed_msg_hdr['sqn'] <= self.msg_hdr_sqn:
+		if parsed_msg_hdr['sqn'] > self.rcv_sqn:
 			raise SiFT_MTP_Error()
 
 		msg_len = int.from_bytes(parsed_msg_hdr['len'], byteorder='big')
@@ -113,7 +114,6 @@ class SiFT_MTP:
 			enc_msg_body = self.receive_bytes(msg_len - self.size_msg_hdr)
 			cipher_nonce = parsed_msg_hdr['sqn'] + parsed_msg_hdr['rnd'] 
 
-			
 			# must save the temp_key for login response to encrypt its data
 			if parsed_msg_hdr['typ'] == self.type_login_req:
 				msg_body, self.temp_key = self.auth_decrypt_login_req(enc_msg_body, msg_hdr, cipher_nonce)
@@ -121,26 +121,32 @@ class SiFT_MTP:
 				size_payload = msg_len - self.size_msg_hdr_mac - self.size_login_tempkey
 			# use temporary key
 			elif parsed_msg_hdr['typ'] == self.type_login_res:
-				msg_body = self.auth_decrypt(enc_msg_body, msg_hdr, self.temp_key, cipher_nonce)
+				msg_body = self.auth_decrypt(enc_msg_body, msg_hdr, self.temp_key)
 				size_payload = msg_len - self.size_msg_hdr_mac
 			else: 
-				msg_body = self.auth_decrypt(enc_msg_body, self.final_key, cipher_nonce)
+				msg_body = self.auth_decrypt(enc_msg_body, msg_hdr, self.final_key)
 				size_payload = msg_len - self.size_msg_hdr_mac
 				
 		except SiFT_MTP_Error as e:
 			raise SiFT_MTP_Error('Unable to receive message body --> ' + e.err_msg)
 
 		# DEBUG 
+
 		if self.DEBUG:
 			print('MTP message received (' + str(msg_len) + '):')
 			print('HDR (' + str(len(msg_hdr)) + '): ' + msg_hdr.hex())
-			print('BDY (' + str(len(msg_body)) + '): ')
+			print('BDY (' + str(len(msg_body)) + '): ' )
 			print(msg_body.hex())
 			print('------------------------------------------')
 		# DEBUG 
 
 		if len(msg_body) != size_payload: 
 			raise SiFT_MTP_Error('Incomplete message body reveived')
+		
+		# incr the receiving sqn number
+		rcv_sqn_int = int.from_bytes(self.rcv_sqn, "big") + 1
+		self.rcv_sqn = rcv_sqn_int.to_bytes(2, 'big')
+
 
 		return parsed_msg_hdr['typ'], msg_body
 
@@ -187,9 +193,15 @@ class SiFT_MTP:
 			raise SiFT_MTP_Error()
 		
 		return dec_payload, self.temp_key
+	
 
-	def auth_decrypt(self, enc_msg_body, msg_hdr, key, cipher_nonce):
+	def auth_decrypt(self, enc_msg_body, msg_hdr, key):
+		# decrypts any type of incoming message, can use the temp or final transfer key
 		try: 
+			parsed_msg_hdr = self.parse_msg_header(msg_hdr)
+
+			cipher_nonce = parsed_msg_hdr['sqn'] + parsed_msg_hdr['rnd']
+
 			AES_GCM_cipher = AES.new(key, AES.MODE_GCM, nonce = cipher_nonce, mac_len = 12)
 			
 			AES_GCM_cipher.update(msg_hdr)
@@ -203,10 +215,10 @@ class SiFT_MTP:
 			# maybe add msg to debug here
 			raise SiFT_MTP_Error()
 		return dec_payload
-
 	
 	def enc_tk(self, temp_key):
 		# allows client to encrypt temporary key
+		# "srvpubkey.pem" for prof's key
 		pubkey = rsa_keygen.load_publickey("rsa_pubkey.pem")
 		RSAcipher = PKCS1_OAEP.new(pubkey)
 		etk = RSAcipher.encrypt(temp_key) 
@@ -242,8 +254,6 @@ class SiFT_MTP:
 		
 		# build message
 		# generate sqn and rnd
-		msg_sqn_int = int.from_bytes(self.msg_hdr_sqn, "big") + 1
-		msg_sqn = msg_sqn_int.to_bytes(2, 'big')
 		msg_rnd = Random.get_random_bytes(6)
 
 		
@@ -251,7 +261,7 @@ class SiFT_MTP:
 			# special case: login request (has different msg_size and uses temp_key)
 			msg_size = self.size_msg_hdr_mac + len(msg_payload) + self.size_login_tempkey
 			msg_hdr_len = msg_size.to_bytes(self.size_msg_hdr_len, byteorder='big')
-			msg_hdr = self.msg_hdr_ver + msg_type + msg_hdr_len + msg_sqn + msg_rnd + self.msg_hdr_rsv
+			msg_hdr = self.msg_hdr_ver + msg_type + msg_hdr_len + self.msg_hdr_sqn + msg_rnd + self.msg_hdr_rsv
 
 			# we will authen decrypt here, generate and use temp key
 			enc_msg, mac, etk = self.build_login_req(msg_hdr, msg_payload)
@@ -270,9 +280,9 @@ class SiFT_MTP:
 			# other case uses final transfer key
 			else:
 				key_used = self.final_key
+
 			# msg_header
-			# see if sqn is implemented ok or if should use as a param in send_msg function
-			msg_hdr = self.msg_hdr_ver + msg_type + msg_hdr_len + msg_sqn + msg_rnd + self.msg_hdr_rsv
+			msg_hdr = self.msg_hdr_ver + msg_type + msg_hdr_len + self.msg_hdr_sqn + msg_rnd + self.msg_hdr_rsv
 
 			# use the final transfer key (ftk)
 			enc_msg, mac = self.auth_encrypt(msg_payload, msg_hdr, key_used)
@@ -292,8 +302,8 @@ class SiFT_MTP:
 		elif self.DEBUG:
 			print('MTP message to send (' + str(msg_size) + '):')
 			print('HDR (' + str(len(msg_hdr)) + '): ' + msg_hdr.hex())
-			print('BDY (' + str(len(msg_payload)) + '): ')
-			print(msg_payload.hex())
+			print('EPD (' + str(len(enc_msg)) + '): ' + enc_msg.hex())
+			print('MAC (' + str(len(mac)) + '): ' + mac.hex())
 			print('------------------------------------------')
 
 
@@ -301,6 +311,11 @@ class SiFT_MTP:
 		try:
 			# final_msg includes header, payload, and mac tag
 			self.send_bytes(final_msg)
+			
+			# incr sqn number
+			msg_sqn_int = int.from_bytes(self.msg_hdr_sqn, "big") + 1
+			self.msg_hdr_sqn = msg_sqn_int.to_bytes(2, 'big')
+
 		except SiFT_MTP_Error as e:
 			raise SiFT_MTP_Error('Unable to send message to peer --> ' + e.err_msg)
 
